@@ -1,0 +1,76 @@
+name: Verify or restore encrypted DR backup
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Exact encrypted DR release tag
+        required: true
+        type: string
+      emit_plaintext_artifact:
+        description: Upload the restored plaintext DB as a 1-day artifact
+        required: true
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  restore:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Checkout private DR tooling
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install pinned crypto dependency
+        run: python -m pip install --disable-pip-version-check cryptography==50.0.0
+
+      - name: Download exact encrypted release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -m 700 restore-work
+          gh release download "${{ inputs.release_tag }}" --repo "${GITHUB_REPOSITORY}" --dir restore-work
+
+      - name: Decrypt and verify SQLite restore
+        env:
+          WFH_DR_AES256_KEY_B64: ${{ secrets.WFH_DR_AES256_KEY_B64 }}
+        run: |
+          python restore_release_backup.py \
+            --manifest "$GITHUB_WORKSPACE/restore-work/waterfall_registry.manifest.json" \
+            --bundle-dir "$GITHUB_WORKSPACE/restore-work" \
+            --output "$GITHUB_WORKSPACE/restore-work/waterfall_registry.db" \
+            | tee "$GITHUB_WORKSPACE/restore-work/restore-report.json"
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          report = json.loads(Path("restore-work/restore-report.json").read_text())
+          if report.get("ok") is not True or report.get("status") != "RESTORE_VERIFIED":
+              raise SystemExit("restore verification failed")
+          print("restore_verification=PASS")
+          PY
+
+      - name: Upload verification report
+        uses: actions/upload-artifact@v4
+        with:
+          name: restore-verification-${{ inputs.release_tag }}
+          path: restore-work/restore-report.json
+          retention-days: 7
+          if-no-files-found: error
+
+      - name: Upload one-day plaintext restore artifact
+        if: ${{ inputs.emit_plaintext_artifact == true }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: plaintext-restore-${{ inputs.release_tag }}
+          path: restore-work/waterfall_registry.db
+          retention-days: 1
+          compression-level: 0
+          if-no-files-found: error
